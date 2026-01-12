@@ -1,3 +1,667 @@
+# live_voting_level1_hardened.py
+# Production-ready voting for 50-5000 person events
+# Requirements: pip install flask flask-socketio eventlet redis cryptography
+
+from flask import Flask, render_template_string, request
+from flask_socketio import SocketIO, emit
+import time
+import hashlib
+import secrets
+from collections import defaultdict, deque
+from datetime import datetime
+import json
+import redis
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = secrets.token_hex(32)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# ── Redis for persistence ───────────────────────────────────────────────
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+    USE_REDIS = True
+    print("✓ Redis connected - using persistent storage")
+except:
+    USE_REDIS = False
+    print("⚠ Redis unavailable - using in-memory storage (votes will be lost on restart)")
+
+# ── Configuration ───────────────────────────────────────────────────────
+VOTE_OPTIONS = [
+    "Stay in EU 🇪🇺",
+    "Leave EU 🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "Leader A – Progressive",
+    "Leader B – Conservative",
+    "Leader C – Technocrat"
+]
+
+# Session & rate limiting
+SESSION_TOKEN_EXPIRY = 1800  # 30 minutes
+MAX_VOTES_PER_WINDOW = 3
+RATE_LIMIT_WINDOW = 60
+MAX_VOTES_PER_IP_PER_DAY = 5
+
+# Content limits
+MAX_REASON_LENGTH = 280
+MAX_RECENT_REASONS = 30
+
+# ── Data stores ─────────────────────────────────────────────────────────
+voting_sessions = {}  # token -> session_data
+voters = set()  # hashed voter IDs
+recent_reasons = deque(maxlen=MAX_RECENT_REASONS)
+vote_timestamps = defaultdict(list)  # IP -> [timestamps]
+daily_ip_votes = {}  # IP -> (date, count)
+
+# ── Persistence helpers ─────────────────────────────────────────────────
+def get_votes():
+    """Get current vote counts"""
+    if USE_REDIS:
+        votes = {}
+        for option in VOTE_OPTIONS:
+            count = redis_client.get(f"vote:{option}")
+            votes[option] = int(count) if count else 0
+        return votes
+    else:
+        # Fallback to in-memory
+        if not hasattr(get_votes, '_cache'):
+            get_votes._cache = defaultdict(int)
+        return dict(get_votes._cache)
+
+def increment_vote(option):
+    """Increment vote count for option"""
+    if USE_REDIS:
+        redis_client.incr(f"vote:{option}")
+    else:
+        if not hasattr(get_votes, '_cache'):
+            get_votes._cache = defaultdict(int)
+        get_votes._cache[option] += 1
+
+def get_total_votes():
+    """Get total number of votes"""
+    if USE_REDIS:
+        total = redis_client.get("vote:total")
+        return int(total) if total else 0
+    else:
+        return sum(get_votes().values())
+
+def increment_total_votes():
+    """Increment total vote counter"""
+    if USE_REDIS:
+        redis_client.incr("vote:total")
+
+def mark_voter(voter_hash):
+    """Mark a voter as having voted"""
+    if USE_REDIS:
+        redis_client.sadd("voters", voter_hash)
+    else:
+        voters.add(voter_hash)
+
+def has_voted(voter_hash):
+    """Check if voter has already voted"""
+    if USE_REDIS:
+        return redis_client.sismember("voters", voter_hash)
+    else:
+        return voter_hash in voters
+
+def store_reason(option, reason_text, timestamp):
+    """Store a voting reason"""
+    if USE_REDIS:
+        reason_data = json.dumps({
+            'option': option,
+            'reason': reason_text,
+            'time': timestamp
+        })
+        redis_client.lpush("reasons", reason_data)
+        redis_client.ltrim("reasons", 0, MAX_RECENT_REASONS - 1)
+
+def get_recent_reasons():
+    """Get recent voting reasons"""
+    if USE_REDIS:
+        reasons_json = redis_client.lrange("reasons", 0, MAX_RECENT_REASONS - 1)
+        return [json.loads(r) for r in reasons_json]
+    else:
+        return list(recent_reasons)
+
+# ── Session management ──────────────────────────────────────────────────
+def generate_voting_token():
+    """Create a new voting session token"""
+    token = secrets.token_urlsafe(32)
+    expiry = time.time() + SESSION_TOKEN_EXPIRY
+    return token, expiry
+
+def cleanup_expired_sessions():
+    """Remove expired session tokens"""
+    now = time.time()
+    expired = [token for token, data in voting_sessions.items() 
+               if data['expiry'] < now]
+    for token in expired:
+        del voting_sessions[token]
+
+# ── Security helpers ────────────────────────────────────────────────────
+def hash_voter_id(fp, ip, token):
+    """Create strong voter hash with multiple signals"""
+    combined = f"{fp}:{ip}:{token}:{app.config['SECRET_KEY']}"
+    return hashlib.sha256(combined.encode()).hexdigest()
+
+def get_extended_fingerprint(base_fp, extended_data):
+    """Combine base fingerprint with extended browser signals"""
+    extended_str = json.dumps(extended_data, sort_keys=True)
+    combined = f"{base_fp}:{extended_str}"
+    return hashlib.sha256(combined.encode()).hexdigest()
+
+def check_rate_limit(ip):
+    """Enhanced rate limiting with short-term and daily limits"""
+    now = time.time()
+    
+    # Short-term rate limit (per minute)
+    timestamps = vote_timestamps[ip]
+    vote_timestamps[ip] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+    
+    if len(vote_timestamps[ip]) >= MAX_VOTES_PER_WINDOW:
+        return False, "Too many votes in quick succession"
+    
+    # Daily rate limit (per 24h)
+    today = datetime.now().date().isoformat()
+    
+    if ip in daily_ip_votes:
+        last_date, count = daily_ip_votes[ip]
+        if last_date == today:
+            if count >= MAX_VOTES_PER_IP_PER_DAY:
+                return False, "Daily vote limit reached for this IP"
+            daily_ip_votes[ip] = (today, count + 1)
+        else:
+            daily_ip_votes[ip] = (today, 1)
+    else:
+        daily_ip_votes[ip] = (today, 1)
+    
+    vote_timestamps[ip].append(now)
+    return True, None
+
+def sanitize_reason(text):
+    """XSS prevention and content filtering"""
+    if not text:
+        return None
+    
+    dangerous_chars = {
+        '<': '&lt;', 
+        '>': '&gt;', 
+        '"': '&quot;', 
+        "'": '&#39;',
+        '&': '&amp;'
+    }
+    
+    for char, replacement in dangerous_chars.items():
+        text = text.replace(char, replacement)
+    
+    # Remove excessive whitespace
+    text = ' '.join(text.split())
+    
+    return text[:MAX_REASON_LENGTH].strip()
+
+def verify_captcha(answer, challenge_id):
+    """Simple math captcha verification"""
+    if challenge_id not in voting_sessions:
+        return False
+    
+    expected = voting_sessions[challenge_id].get('captcha_answer')
+    return expected is not None and str(answer) == str(expected)
+
+# ── Routes ──────────────────────────────────────────────────────────────
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/stats')
+def stats():
+    """Public API for current statistics"""
+    return {
+        'votes': get_votes(),
+        'total': get_total_votes(),
+        'recentReasons': get_recent_reasons()[-10:],
+        'timestamp': time.time()
+    }
+
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    return {
+        'status': 'ok',
+        'redis': USE_REDIS,
+        'total_votes': get_total_votes(),
+        'active_sessions': len(voting_sessions)
+    }
+
+# ── SocketIO handlers ───────────────────────────────────────────────────
+@socketio.on('connect')
+def handle_connect():
+    """Send current state to new connections"""
+    cleanup_expired_sessions()
+    
+    emit('update', {
+        'votes': get_votes(),
+        'total': get_total_votes(),
+        'recentReasons': get_recent_reasons()
+    })
+
+@socketio.on('request_token')
+def give_token(data):
+    """Issue voting session token with captcha"""
+    client_ip = request.environ.get('HTTP_X_REAL_IP', request.remote_addr)
+    
+    # Check if IP is rate limited
+    allowed, error = check_rate_limit(client_ip)
+    if not allowed:
+        return emit('error', {'message': error})
+    
+    # Generate simple math captcha
+    import random
+    a = random.randint(1, 20)
+    b = random.randint(1, 20)
+    answer = a + b
+    
+    token, expiry = generate_voting_token()
+    
+    voting_sessions[token] = {
+        'fp_hash': None,
+        'ip': client_ip,
+        'expiry': expiry,
+        'used': False,
+        'captcha_answer': answer,
+        'created_at': time.time()
+    }
+    
+    emit('voting_token', {
+        'token': token,
+        'captcha': f"What is {a} + {b}?",
+        'expires_in': SESSION_TOKEN_EXPIRY
+    })
+
+@socketio.on('vote')
+def handle_vote(data):
+    """Process vote with full validation"""
+    try:
+        cleanup_expired_sessions()
+        
+        # Validate token
+        token = data.get('token')
+        if not token or token not in voting_sessions:
+            return emit('error', {'message': 'Invalid or expired session. Please refresh.'})
+        
+        session = voting_sessions[token]
+        
+        # Check expiry
+        if time.time() > session['expiry']:
+            del voting_sessions[token]
+            return emit('error', {'message': 'Session expired. Please refresh.'})
+        
+        # Check if already used
+        if session['used']:
+            return emit('already_voted')
+        
+        # Verify captcha
+        captcha_answer = data.get('captcha_answer')
+        if not verify_captcha(captcha_answer, token):
+            return emit('error', {'message': 'Incorrect captcha. Please try again.'})
+        
+        # Validate vote data
+        fp = data.get('fingerprint')
+        extended_data = data.get('extended', {})
+        option_idx = data.get('option')
+        reason = data.get('reason')
+        pubkey_pem = data.get('public_key')  # Optional cryptographic signature
+        
+        if not fp or not isinstance(option_idx, int):
+            return emit('error', {'message': 'Invalid vote data'})
+        
+        if not (0 <= option_idx < len(VOTE_OPTIONS)):
+            return emit('error', {'message': 'Invalid option selected'})
+        
+        # Create enhanced voter hash
+        extended_fp = get_extended_fingerprint(fp, extended_data)
+        voter_hash = hash_voter_id(extended_fp, session['ip'], token)
+        
+        # Check duplicate vote
+        if has_voted(voter_hash):
+            session['used'] = True
+            return emit('already_voted')
+        
+        # Record vote
+        option = VOTE_OPTIONS[option_idx]
+        increment_vote(option)
+        increment_total_votes()
+        mark_voter(voter_hash)
+        
+        # Store public key if provided (for future verification)
+        if pubkey_pem and USE_REDIS:
+            redis_client.hset("vote_signatures", voter_hash, pubkey_pem)
+        
+        # Store reason
+        sanitized_reason = sanitize_reason(reason)
+        if sanitized_reason:
+            timestamp = time.time()
+            reason_data = {
+                'option': option,
+                'reason': sanitized_reason,
+                'time': timestamp
+            }
+            recent_reasons.append(reason_data)
+            store_reason(option, sanitized_reason, timestamp)
+        
+        # Mark session as used
+        session['used'] = True
+        session['fp_hash'] = voter_hash
+        session['voted_at'] = time.time()
+        
+        # Broadcast update
+        emit('update', {
+            'votes': get_votes(),
+            'total': get_total_votes(),
+            'recentReasons': get_recent_reasons()
+        }, broadcast=True)
+        
+        # Confirm to voter
+        emit('vote_confirmed', {
+            'option': option,
+            'voter_id': voter_hash[:16]  # Partial hash for receipt
+        })
+        
+        print(f"✓ Vote: {option} | Total: {get_total_votes()} | Hash: {voter_hash[:12]}...")
+        
+    except Exception as e:
+        print(f"Error processing vote: {e}")
+        emit('error', {'message': 'Failed to process vote. Please try again.'})
+
+# ── HTML Template ───────────────────────────────────────────────────────
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Secure Voting • Level 1 Hardened</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@fingerprintjs/fingerprintjs@4/dist/fp.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg: #0a0a14;
+            --card: #1a1a2e;
+            --accent: #7c3aed;
+            --text: #e0e0ff;
+            --muted: #a0a0cc;
+            --success: #10b981;
+            --error: #ef4444;
+            --warning: #f59e0b;
+        }
+        
+        * { box-sizing: border-box; }
+        
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, var(--bg) 0%, #1a0a2e 100%);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #7c3aed 0%, #ec4899 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+        
+        .subtitle {
+            color: var(--muted);
+            font-size: 1rem;
+        }
+        
+        .security-badge {
+            display: inline-block;
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success);
+            padding: 0.4rem 1rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            margin-top: 0.5rem;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+        
+        .stats {
+            text-align: center;
+            margin: 2rem 0;
+            padding: 1.5rem;
+            background: rgba(124, 58, 237, 0.1);
+            border-radius: 12px;
+            border: 1px solid rgba(124, 58, 237, 0.2);
+        }
+        
+        .stats-number {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: var(--accent);
+        }
+        
+        .captcha-container {
+            background: var(--card);
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin: 2rem auto;
+            max-width: 400px;
+            border: 2px solid var(--accent);
+        }
+        
+        .captcha-question {
+            font-size: 1.3rem;
+            margin-bottom: 1rem;
+            text-align: center;
+            color: var(--accent);
+        }
+        
+        .captcha-input {
+            width: 100%;
+            padding: 1rem;
+            font-size: 1.2rem;
+            background: rgba(124, 58, 237, 0.1);
+            border: 2px solid rgba(124, 58, 237, 0.3);
+            border-radius: 8px;
+            color: var(--text);
+            text-align: center;
+        }
+        
+        .captcha-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .options {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 1rem;
+            margin: 2rem 0;
+        }
+        
+        .option {
+            background: var(--card);
+            padding: 1.5rem;
+            border-radius: 12px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            border: 2px solid transparent;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .option::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(124, 58, 237, 0.2), transparent);
+            transition: left 0.5s;
+        }
+        
+        .option:hover::before {
+            left: 100%;
+        }
+        
+        .option:hover {
+            transform: translateY(-6px);
+            border-color: var(--accent);
+            box-shadow: 0 8px 30px rgba(124, 58, 237, 0.3);
+        }
+        
+        .option.active {
+            border-color: var(--accent);
+            background: rgba(124, 58, 237, 0.15);
+            box-shadow: 0 0 20px rgba(124, 58, 237, 0.4);
+        }
+        
+        .option-text {
+            font-size: 1.1rem;
+            font-weight: 500;
+        }
+        
+        .option-votes {
+            margin-top: 0.5rem;
+            font-size: 0.9rem;
+            color: var(--muted);
+        }
+        
+        #reason {
+            width: 100%;
+            max-width: 700px;
+            margin: 1.5rem auto;
+            padding: 1rem;
+            border-radius: 10px;
+            background: var(--card);
+            color: var(--text);
+            border: 2px solid #333;
+            font-size: 1rem;
+            font-family: inherit;
+            resize: vertical;
+            transition: border-color 0.3s;
+            display: block;
+        }
+        
+        #reason:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .char-counter {
+            text-align: center;
+            color: var(--muted);
+            font-size: 0.85rem;
+            margin-top: 0.5rem;
+        }
+        
+        .vote-btn {
+            display: block;
+            margin: 2rem auto;
+            padding: 1.2rem 3rem;
+            font-size: 1.2rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, var(--accent) 0%, #9333ea 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 4px 15px rgba(124, 58, 237, 0.4);
+        }
+        
+        .vote-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(124, 58, 237, 0.6);
+        }
+        
+        .vote-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        #chart-container {
+            background: var(--card);
+            padding: 2rem;
+            border-radius: 12px;
+            margin: 2rem 0;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+        
+        #reasons-feed {
+            margin-top: 3rem;
+        }
+        
+        #reasons-feed h3 {
+            color: var(--accent);
+            margin-bottom: 1.5rem;
+        }
+        
+        .reasons-list {
+            max-height: 500px;
+            overflow-y: auto;
+            padding-right: 1rem;
+        }
+        
+        .reason-item {
+            background: rgba(124, 58, 237, 0.08);
+            padding: 1.2rem;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+            border-left: 4px solid var(--accent);
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+        
+        .reason-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        
+        .reason-option {
+            font-weight: 600;
+            color: var(--accent);
+        }
+        
+        .reason-time {
+            font-size: 0.85rem;
+            color: var(--muted);
+        }
+        
+        .r
+
+
 # 🌌 Collective Pulse — Scatter-Aware Civic Intelligence
 
 > **What happens when many scattered lights decide to breathe together?**  
