@@ -463,3 +463,282 @@ MIT License — see [LICENSE](./LICENSE)
 with Claude (somatic grounding) + Grok (cognitive reframe)
 
 🌊🔦💜 *Scatter-aware civic intelligence. Always reversible. Always with rest.*
+
+---
+
+# live_voting_prototype_2026.py
+# Quick-start real-time voting demo
+# Requirements: pip install flask flask-socketio eventlet
+
+from flask import Flask, render_template_string, request
+from flask_socketio import SocketIO, emit
+import time
+from collections import defaultdict, deque
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# ── Data ────────────────────────────────────────────────────────────────
+VOTE_OPTIONS = [
+    "Stay in EU 🇪🇺",
+    "Leave EU 🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "Leader A – Progressive",
+    "Leader B – Conservative",
+    "Leader C – Technocrat"
+]
+
+votes = defaultdict(int)                    # option → count
+voters = set()                              # fingerprints that already voted
+recent_reasons = deque(maxlen=12)           # last explanations
+
+# ── HTML + JS (single-file app) ─────────────────────────────────────────
+@app.route('/')
+def index():
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+        <title>Live Pulse • Quick Demo 2026</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script>
+        <script src="https://openfpcdn.io/fingerprintjs/v5"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            :root {
+                --bg: #0f0f1a;
+                --card: #1a1a2e;
+                --accent: #7c3aed;
+                --text: #e0e0ff;
+                --muted: #a0a0cc;
+            }
+            body {
+                margin:0; padding:20px;
+                font-family: system-ui, sans-serif;
+                background: var(--bg);
+                color: var(--text);
+                min-height: 100vh;
+                display: grid;
+                place-items: center;
+            }
+            .container { max-width: 900px; width:100%; }
+            h1 { text-align:center; color: var(--accent); margin-bottom: 0.4em; }
+            .subtitle { text-align:center; color:var(--muted); margin-bottom:2rem; }
+
+            .options {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                gap: 1rem;
+                margin: 2rem 0;
+            }
+            .option {
+                background: var(--card);
+                padding: 1.5rem;
+                border-radius: 12px;
+                text-align: center;
+                cursor: pointer;
+                transition: all 0.2s;
+                border: 1px solid transparent;
+            }
+            .option:hover {
+                transform: translateY(-4px);
+                border-color: var(--accent);
+                box-shadow: 0 0 20px rgba(124,58,237,0.2);
+            }
+            .option.active { border-color: var(--accent); background: rgba(124,58,237,0.12); }
+
+            #reason { 
+                width: 100%; max-width: 600px; margin: 1.5rem auto;
+                padding: 1rem; border-radius: 8px;
+                background: var(--card); color: var(--text);
+                border: 1px solid #333;
+                font-size: 1rem; resize: vertical;
+            }
+
+            #chart-container {
+                background: var(--card);
+                padding: 1.5rem;
+                border-radius: 12px;
+                margin: 2rem 0;
+            }
+
+            #reasons-feed {
+                margin-top: 2rem;
+                max-height: 320px;
+                overflow-y: auto;
+                padding-right: 1rem;
+            }
+            .reason-item {
+                background: rgba(124,58,237,0.08);
+                padding: 1rem;
+                border-radius: 8px;
+                margin-bottom: 0.8rem;
+                font-size: 0.95rem;
+                border-left: 3px solid var(--accent);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Live Collective Pulse</h1>
+            <p class="subtitle">Quick real-time voting prototype • January 2026</p>
+
+            <div class="options">
+                ${options_html}
+            </div>
+
+            <textarea id="reason" rows="3" placeholder="Why did you choose this? (optional, public)"></textarea>
+
+            <div id="chart-container">
+                <canvas id="resultsChart"></canvas>
+            </div>
+
+            <div id="reasons-feed">
+                <h3 style="margin-top:0">Recent Voices</h3>
+                <div id="reasonsList"></div>
+            </div>
+        </div>
+
+        <script>
+        const socket = io();
+        let myFingerprint = null;
+        let selectedOption = null;
+
+        // ── Fingerprint ─────────────────────────────────────────────────────
+        (async () => {
+            const fp = await FingerprintJS.load();
+            const result = await fp.get();
+            myFingerprint = result.visitorId;
+            console.log("Device ID:", myFingerprint);
+        })();
+
+        // ── Chart ───────────────────────────────────────────────────────────
+        const ctx = document.getElementById('resultsChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: ${JSON.stringify(VOTE_OPTIONS)},
+                datasets: [{
+                    data: ${JSON.stringify([0]*len(VOTE_OPTIONS))},
+                    backgroundColor: [
+                        '#7c3aed', '#ec4899', '#22d3ee', '#f59e0b', '#10b981'
+                    ],
+                    borderWidth: 1,
+                    borderColor: 'rgba(15,15,26,0.8)'
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { position: 'bottom', labels: { color: '#e0e0ff' } }
+                },
+                cutout: '60%'
+            }
+        });
+
+        // ── UI interactions ─────────────────────────────────────────────────
+        document.querySelectorAll('.option').forEach(el => {
+            el.addEventListener('click', () => {
+                document.querySelectorAll('.option').forEach(e => e.classList.remove('active'));
+                el.classList.add('active');
+                selectedOption = el.dataset.value;
+            });
+        });
+
+        function submitVote() {
+            if (!selectedOption) {
+                alert("Please select an option first.");
+                return;
+            }
+            if (!myFingerprint) {
+                alert("Still identifying your device... try again in 2 seconds.");
+                return;
+            }
+
+            const reason = document.getElementById('reason').value.trim();
+
+            socket.emit('vote', {
+                fingerprint: myFingerprint,
+                option: selectedOption,
+                reason: reason || null
+            });
+
+            // Visual feedback
+            document.getElementById('reason').value = '';
+            document.querySelectorAll('.option').forEach(e => e.classList.remove('active'));
+            selectedOption = null;
+        }
+
+        // Create vote button dynamically
+        const btn = document.createElement('button');
+        btn.textContent = 'Cast Vote';
+        btn.style = 'display:block; margin:2rem auto; padding:1rem 2.5rem; font-size:1.2rem; background:var(--accent); color:white; border:none; border-radius:12px; cursor:pointer;';
+        btn.onclick = submitVote;
+        document.querySelector('.container').appendChild(btn);
+
+        // ── Socket events ───────────────────────────────────────────────────
+        socket.on('update', (data) => {
+            chart.data.datasets[0].data = Object.values(data.votes);
+            chart.update();
+
+            const list = document.getElementById('reasonsList');
+            list.innerHTML = '';
+            data.recentReasons.forEach(r => {
+                const div = document.createElement('div');
+                div.className = 'reason-item';
+                div.innerHTML = `<strong>\( {r.option}</strong><br> \){r.reason || '<i>no comment</i>'}
+                                 <small style="color:#777; float:right;">${new Date(r.time*1000).toLocaleTimeString()}</small>`;
+                list.appendChild(div);
+            });
+        });
+
+        socket.on('already_voted', () => {
+            alert("You've already voted from this device. Thank you! 🌟");
+        });
+        </script>
+    </body>
+    </html>
+    '''.replace("${options_html}", "\n".join(
+        f'<div class="option" data-value="{i}">{opt}</div>'
+        for i, opt in enumerate(VOTE_OPTIONS)
+    )).replace("\( {JSON.stringify(VOTE_OPTIONS)}", str(VOTE_OPTIONS)).replace(" \){JSON.stringify([0]*len(VOTE_OPTIONS))}", str([0]*len(VOTE_OPTIONS))))
+
+# ── SocketIO logic ──────────────────────────────────────────────────────
+@socketio.on('vote')
+def handle_vote(data):
+    fp = data['fingerprint']
+    option_idx = data['option']
+    reason = data.get('reason')
+
+    if fp in voters:
+        emit('already_voted')
+        return
+
+    if not (0 <= option_idx < len(VOTE_OPTIONS)):
+        return
+
+    option = VOTE_OPTIONS[option_idx]
+    votes[option] += 1
+    voters.add(fp)
+
+    if reason:
+        recent_reasons.append({
+            'option': option,
+            'reason': reason[:280],
+            'time': time.time()
+        })
+
+    emit('update', {
+        'votes': dict(votes),
+        'recentReasons': list(recent_reasons)
+    }, broadcast=True)
+
+    print(f"Vote received → {option}  |  fp: {fp[:8]}...")
+
+# ── Start ───────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    print("\n" + "═"*70)
+    print("  LIVE VOTING PROTOTYPE  •  Quick-start reference  •  2026")
+    print("  Open:   http://localhost:5050")
+    print("═"*70 + "\n")
+    socketio.run(app, host='0.0.0.0', port=5050, allow_unsafe_werkzeug=True)
