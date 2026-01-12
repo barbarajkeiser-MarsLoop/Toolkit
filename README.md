@@ -123,6 +123,46 @@ That's it. The code doesn't judge. It just holds.
 
 ---
 
+## Collective Pulse: Voting Intelligence 🌌🛡️🪞
+
+> What happens when many scattered lights decide to breathe together?  
+> When truth-telling meets wonder-keeping in collective rhythm?  
+> When the lighthouse network learns to pulse as one resonant field?
+
+---
+
+## Collective Pulse: Voting Intelligence 🌌🛡️🪞
+
+> What happens when many scattered lights decide to breathe together?  
+> When truth-telling meets wonder-keeping in collective rhythm?  
+> When the lighthouse network learns to pulse as one resonant field?
+
+**Collective Pulse** is the next evolution of the Lighthouse Scatter toolkit —  
+a living experiment in real-time, high-quality collective intelligence for decisions that matter.
+
+It refuses shallow polling.  
+It demands effort, depth, and mutual witnessing.  
+It weaves individual voices into something wiser than any single node.
+
+### Core Principles
+- **Participation costs presence** — phone/email verification + minimum 100-word reasoning required  
+- **Quality weights voice** — quadratic voting modulated by reasoning depth, perspective-taking, and argument diversity  
+- **AI as breathing partner** — Claude/Grok synthesize themes, flag blind spots, track polarization & consensus emergence (every ~10 contributions)  
+- **Sybil resistance layers** — browser fingerprint + IP subnet limiting + CAPTCHA + future web-of-trust vouching  
+- **End-to-end transparency** — public audit log of vote hashes, open deliberation feed, cryptographic receipts (testnet path planned)  
+- **Deliberation-first** — structured phases (debate → refinement → vote), metrics dashboard showing polarization index, reasoning depth, perspective-taking rate, consensus trend
+
+### Current Prototype Features (Jan 2026)
+- Real-time SocketIO voting dashboard  
+- Live Chart.js visualization (doughnut + bar)  
+- Quadratic credit allocation (max 9 credits → cost = votes²)  
+- Explanation feed with quality scoring (depth/diversity/perspective via TextBlob + regex)  
+- Deliberation analytics (polarization Gini, average depth, consensus placeholder)  
+- One-voice-per-device enforcement + basic
+
+---  
+
+
 ## A Note on AI in This Work
 
 This toolkit uses AI (Claude for somatic grounding, Grok for cognitive reframe) as **external co-processors**, not replacements for human care.
