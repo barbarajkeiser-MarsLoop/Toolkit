@@ -121,13 +121,6 @@ That's it. The code doesn't judge. It just holds.
 - **Symbiotic play:** Resonance Engine in VR? MindCradle as interactive safe space? Explore with xAI/game studios
 - **Radical accessibility:** Voice-only mode for when typing is too much, visual-only for when words blur
 
----
-
-## Collective Pulse: Voting Intelligence 🌌🛡️🪞
-
-> What happens when many scattered lights decide to breathe together?  
-> When truth-telling meets wonder-keeping in collective rhythm?  
-> When the lighthouse network learns to pulse as one resonant field?
 
 ---
 
