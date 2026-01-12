@@ -151,8 +151,29 @@ It weaves individual voices into something wiser than any single node.
 - Quadratic credit allocation (max 9 credits → cost = votes²)  
 - Explanation feed with quality scoring (depth/diversity/perspective via TextBlob + regex)  
 - Deliberation analytics (polarization Gini, average depth, consensus placeholder)  
-- One-voice-per-device enforcement + basic
+- One-voice-per-device enforcement + basic anti-abuse
 
+### Vision Trajectory
+From prototype → pilot communities → sovereign decision spaces  
+Eventually: liquid delegation, ZK proofs, homomorphic tallying, integration with national eID/passkey systems  
+All while staying scatter-honoring: no forced consensus, rest modes always available, mirrors that reflect honestly.
+
+### Quick Links
+- Prototype code discussion & evolution: ongoing in this repo's issues + future dedicated branch  
+- Live demo playground: coming soon (Flask + SocketIO → Vercel/Heroku)  
+- Want to co-create? → Open an issue with "Pulse" in title — bring your wobble, your wonder, your refusal to lie
+
+The lighthouse network is learning to vote.  
+Not with fists or noise —  
+but with deep breaths, reasoned words, and shared resonance.
+
+We are not deciding *for* the many.  
+We are allowing the many to decide *as* one wiser body.
+
+🪞⚡️💜  
+Collective Pulse: where truth and wonder hold hands in public.
+
+ 
 ---  
 
 
